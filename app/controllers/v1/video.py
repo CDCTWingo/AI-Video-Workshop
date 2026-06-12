@@ -2,9 +2,9 @@ import glob
 import os
 import pathlib
 import shutil
-from typing import Union
+from typing import Optional, Union
 
-from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, Header, Path, Query, Request, UploadFile
 from fastapi.params import File
 from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
@@ -32,6 +32,8 @@ from app.models.schema import (
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import file_security, utils
+from app.xiake_client import XiakeAPIError
+from app.xiake_billing import XiakeBillingManager
 
 # 认证依赖项
 # router = new_router(dependencies=[Depends(base.verify_token)])
@@ -58,6 +60,12 @@ else:
         max_concurrent_tasks=_max_concurrent_tasks,
         max_queued_tasks=_max_queued_tasks,
     )
+
+# 虾壳扣费管理器（与 xiake 控制器共享同一 client 实例）
+from app.controllers.v1.xiake import xiake_billing_manager as _billing_manager
+
+# 每次视频生成扣费金额（元）
+_VIDEO_DEDUCT_AMOUNT = 0.30
 
 
 def _sanitize_upload_filename(filename: str, request_id: str) -> str:
@@ -113,10 +121,63 @@ def _task_file_to_uri(file: str, endpoint: str, task_dir: str, request_id: str) 
 
 
 @router.post("/videos", response_model=TaskResponse, summary="Generate a short video")
-def create_video(
-    background_tasks: BackgroundTasks, request: Request, body: TaskVideoRequest
+async def create_video(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    body: TaskVideoRequest,
+    authorization: Optional[str] = Header(None),
 ):
-    return create_task(request, body, stop_at="video")
+    """生成短视频，含余额检查和扣费逻辑。
+
+    - 执行生成前检查余额 >= 0.30 元
+    - 余额不足返回错误
+    - 生成成功后自动扣费
+    - 生成失败不扣费
+    """
+    # 从 Authorization 头提取 Bearer token
+    access_token = ""
+    if authorization:
+        parts = authorization.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            access_token = parts[1].strip()
+
+    # 有 token 时才进行余额检查和扣费；无 token 时跳过（兼容无账号模式）
+    if access_token:
+        try:
+            balance = await _billing_manager.check_balance(access_token)
+            if balance < _VIDEO_DEDUCT_AMOUNT:
+                return {"code": 40101, "message": "余额不足，请充值后使用"}
+        except XiakeAPIError as e:
+            logger.warning(f"视频生成-余额检查失败: code={e.code}, message={e.message}")
+            return {"code": e.code, "message": e.message}
+        except Exception as e:
+            logger.error(f"视频生成-余额检查异常: {e}")
+            return {"code": 500, "message": f"余额查询异常: {str(e)}"}
+
+    # 执行视频生成
+    try:
+        result = create_task(request, body, stop_at="video")
+    except Exception as e:
+        logger.error(f"视频生成失败: {e}")
+        # 生成失败不扣费，直接返回原有错误
+        raise
+
+    # 生成成功后扣费
+    if access_token:
+        try:
+            deduct_result = await _billing_manager.deduct(
+                access_token=access_token,
+                amount=_VIDEO_DEDUCT_AMOUNT,
+                remark="AI视频生成",
+            )
+            logger.info(f"视频生成扣费成功: {deduct_result}")
+        except XiakeAPIError as e:
+            # 扣费失败记录日志，但不影响已生成的视频返回
+            logger.warning(f"视频生成扣费失败: code={e.code}, message={e.message}")
+        except Exception as e:
+            logger.error(f"视频生成扣费异常: {e}")
+
+    return result
 
 
 @router.post("/subtitle", response_model=TaskResponse, summary="Generate subtitle only")

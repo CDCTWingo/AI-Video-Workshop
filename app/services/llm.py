@@ -470,21 +470,29 @@ def _generate_response(prompt: str) -> str:
                     base_url=base_url,
                 )
 
+            # Use streaming mode - many OpenAI-compatible providers (like shenve10)
+            # only support streaming or return broken non-streaming responses.
+            # Streaming is more reliable across providers.
             response = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt}]
+                model=model_name, messages=[{"role": "user", "content": prompt}],
+                stream=True
             )
+            content = ""
             if response:
-                if isinstance(response, ChatCompletion):
-                    return _extract_chat_completion_text(response, llm_provider)
-                else:
-                    raise Exception(
-                        f'[{llm_provider}] returned an invalid response: "{response}", please check your network '
-                        f"connection and try again."
-                    )
-            else:
-                raise Exception(
-                    f"[{llm_provider}] returned an empty response, please check your network connection and try again."
-                )
+                for chunk in response:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        content += delta.content
+            
+            if content.strip():
+                return _normalize_text_response(content, llm_provider)
+            
+            raise Exception(
+                f"[{llm_provider}] returned an empty response (completion_tokens=0), "
+                f"please check your network connection and try again."
+            )
 
         return _normalize_text_response(content, llm_provider)
     except Exception as e:

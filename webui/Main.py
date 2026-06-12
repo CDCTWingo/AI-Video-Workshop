@@ -3,6 +3,7 @@ import sys
 import webbrowser
 from uuid import UUID, uuid4
 
+import requests
 import streamlit as st
 from loguru import logger
 
@@ -27,16 +28,13 @@ from app.services import task as tm
 from app.utils import utils
 
 st.set_page_config(
-    page_title="MoneyPrinterTurbo",
-    page_icon="🤖",
+    page_title="AI Video Workshop",
+    page_icon="🎬",
     layout="wide",
     initial_sidebar_state="auto",
     menu_items={
-        "Report a bug": "https://github.com/harry0703/MoneyPrinterTurbo/issues",
-        "About": "# MoneyPrinterTurbo\nSimply provide a topic or keyword for a video, and it will "
-        "automatically generate the video copy, video materials, video subtitles, "
-        "and video background music before synthesizing a high-definition short "
-        "video.\n\nhttps://github.com/harry0703/MoneyPrinterTurbo",
+        "Report a bug": "https://github.com/CDCTWingo/AI-Video-Workshop/issues",
+        "About": "# AI Video Workshop\nAI-powered short video generation.\nBased on MoneyPrinterTurbo v1.2.9 (MIT).\n\nhttps://github.com/CDCTWingo/AI-Video-Workshop",
     },
 )
 
@@ -57,6 +55,9 @@ i18n_dir = os.path.join(root_dir, "webui", "i18n")
 config_file = os.path.join(root_dir, "webui", ".streamlit", "webui.toml")
 system_locale = utils.get_system_locale()
 
+# ── 虾壳平台 API 配置 ─────────────────────────────────────────────────────
+XIAKE_API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")
+
 
 if "video_subject" not in st.session_state:
     st.session_state["video_subject"] = ""
@@ -76,6 +77,81 @@ if "local_video_materials" not in st.session_state:
     # 记住用户最近一次已经落盘的本地素材，避免仅修改文案后二次生成时丢失素材列表。
     st.session_state["local_video_materials"] = []
 
+# ── 虾壳平台认证 ──────────────────────────────────────────────────────
+if "xiake_token" not in st.session_state:
+    st.session_state["xiake_token"] = ""
+if "xiake_user_info" not in st.session_state:
+    st.session_state["xiake_user_info"] = None
+if "xiake_authenticated" not in st.session_state:
+    st.session_state["xiake_authenticated"] = False
+
+_test_mode = st.query_params.get("test_mode", "").lower() in ("true", "1", "yes")
+_session_key = st.query_params.get("session_key", "")
+
+if _test_mode and not st.session_state["xiake_authenticated"]:
+    # 测试模式：使用 mock 数据
+    st.session_state["xiake_token"] = "mock_access_token_xxx"
+    st.session_state["xiake_user_info"] = {
+        "userId": 999,
+        "nickname": "测试用户",
+        "avatar": "",
+        "balance": 10.00,
+        "level": "normal",
+    }
+    st.session_state["xiake_authenticated"] = True
+elif _session_key and not st.session_state["xiake_authenticated"]:
+    # 有 session_key → 调后端认证接口换取 token + 用户信息
+    try:
+        resp = requests.post(
+            f"{XIAKE_API_BASE}/xiake/auth",
+            json={"session_key": _session_key},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 0:
+                result = data.get("data", {})
+                st.session_state["xiake_token"] = result.get("accessToken", "")
+                st.session_state["xiake_user_info"] = result.get("userInfo", None)
+                st.session_state["xiake_authenticated"] = True
+            else:
+                st.error(f"认证失败：{data.get('message', '未知错误')}")
+        else:
+            st.error(f"认证服务异常 (HTTP {resp.status_code})")
+    except Exception as e:
+        st.error(f"无法连接认证服务：{e}")
+
+if not st.session_state["xiake_authenticated"]:
+    st.warning("⚠️ 请从虾壳平台进入本应用")
+    st.info("如果您是开发者，可在 URL 后添加 `?test_mode=true` 进入测试模式")
+    st.stop()
+
+
+def _refresh_xiake_balance():
+    """刷新虾壳用户余额（调用 /xiake/user 接口）"""
+    token = st.session_state.get("xiake_token", "")
+    if not token:
+        return
+    try:
+        resp = requests.get(
+            f"{XIAKE_API_BASE}/xiake/user",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 0:
+                user_info = data.get("data", {})
+                st.session_state["xiake_user_info"] = user_info
+    except Exception:
+        pass  # 静默失败，不影响主流程
+
+
+def _get_xiake_balance() -> float:
+    """获取当前余额"""
+    info = st.session_state.get("xiake_user_info") or {}
+    return float(info.get("balance", 0))
+
 # 加载语言文件
 locales = utils.load_locales(i18n_dir)
 
@@ -83,7 +159,7 @@ locales = utils.load_locales(i18n_dir)
 title_col, lang_col = st.columns([3, 1])
 
 with title_col:
-    st.title(f"MoneyPrinterTurbo v{config.project_version}")
+    st.title(f"🎬 AI Video Workshop v{config.project_version}")
 
 with lang_col:
     display_languages = []
@@ -104,6 +180,28 @@ with lang_col:
         code = selected_language.split(" - ")[0].strip()
         st.session_state["ui_language"] = code
         config.ui["language"] = code
+
+# ── 用户信息展示条 ─────────────────────────────────────────────────────
+_user_info = st.session_state.get("xiake_user_info") or {}
+_nickname = _user_info.get("nickname", "未知用户")
+_balance = float(_user_info.get("balance", 0))
+_level = _user_info.get("level", "normal")
+_level_label = {"normal": "普通", "vip": "VIP", "svip": "SVIP"}.get(_level, _level)
+
+_user_col1, _user_col2, _user_col3, _user_col4 = st.columns([2, 2, 2, 1])
+with _user_col1:
+    st.markdown(f"👤 **{_nickname}**")
+with _user_col2:
+    st.markdown(f"💰 ¥{_balance:.2f}")
+with _user_col3:
+    st.markdown(f"⭐ {_level_label}")
+with _user_col4:
+    if st.button("🔄", help="刷新余额"):
+        _refresh_xiake_balance()
+        st.rerun()
+
+if _balance < 0.30:
+    st.warning("⚠️ 余额不足，请充值后使用")
 
 support_locales = [
     "zh-CN",
@@ -216,6 +314,91 @@ def tr(key):
     loc = locales.get(st.session_state["ui_language"], {})
     return loc.get("Translation", {}).get(key, key)
 
+
+# ====== Sidebar: Task History ======
+with st.sidebar:
+    st.header("📋 Task History")
+    
+    # Import state manager
+    from app.services import state as sm
+    from app.models import const as task_const
+    
+    task_list, task_total = sm.state.get_all_tasks(page=1, page_size=20)
+    
+    if not task_list:
+        st.info("No tasks yet. Generate your first video! 🎬")
+    else:
+        # Sort newest first
+        sorted_tasks = sorted(
+            task_list,
+            key=lambda t: t.get("created_at", ""),
+            reverse=True
+        )
+        
+        for task in sorted_tasks[:20]:  # Show last 20 tasks
+            task_id = task.get("task_id", "")
+            state = task.get("state", 0)
+            progress = task.get("progress", 0)
+            script = task.get("script", "")
+            videos = task.get("videos", [])
+            
+            # State badge
+            state_labels = {
+                task_const.TASK_STATE_FAILED: "❌",
+                task_const.TASK_STATE_COMPLETE: "✅",
+                task_const.TASK_STATE_PROCESSING: "🔄",
+            }
+            state_icon = state_labels.get(state, "⏳")
+            
+            # Script preview
+            preview = (script[:40] + "...") if script and len(script) > 40 else (script or "No script")
+            
+            # Task card
+            with st.expander(f"{state_icon} {preview}", expanded=(state == task_const.TASK_STATE_COMPLETE)):
+                st.caption(f"ID: `{task_id}`")
+                st.progress(progress / 100.0, text=f"{progress}%")
+                
+                # If completed, show video player
+                if state == task_const.TASK_STATE_COMPLETE and videos:
+                    for video_path in videos:
+                        video_filename = os.path.basename(video_path)
+                        endpoint = config.app.get("endpoint", "")
+                        if endpoint:
+                            video_url = f"{endpoint}/tasks/{task_id}/{video_filename}"
+                        else:
+                            video_url = f"/tasks/{task_id}/{video_filename}"
+                        try:
+                            st.video(video_url)
+                            st.markdown(f"[⬇️ Download]({video_url})")
+                        except Exception:
+                            st.caption(f"📁 {video_filename}")
+    
+    st.markdown("---")
+    st.caption("AI Video Workshop v" + config.project_version)
+    st.caption("Based on MoneyPrinterTurbo (MIT)")
+
+
+# Helper functions for API key management (used by both Basic Settings panel
+# and the Video Source section, so defined at module scope).
+def get_keys_from_config(cfg_key):
+    api_keys = config.app.get(cfg_key, [])
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    api_key = ", ".join(api_keys)
+    return api_key
+
+def save_keys_to_config(cfg_key, value, original_value=None):
+    """Save API keys to config. If value is empty (e.g. from Streamlit
+    password rerun), restore the original config value to prevent
+    the unconditional ``config.save_config()`` at script end from
+    overwriting the file with a blank."""
+    value = value.replace(" ", "")
+    if value:
+        config.app[cfg_key] = value.split(",")
+    elif original_value:
+        # Streamlit text_input(type="password") returns "" on rerun;
+        # restore the original config value so it isn't lost.
+        config.app[cfg_key] = original_value
 
 # 创建基础设置折叠框
 if not config.app.get("hide_config", False):
@@ -513,31 +696,23 @@ if not config.app.get("hide_config", False):
         # 右侧面板 - API 密钥设置
         with right_config_panel:
 
-            def get_keys_from_config(cfg_key):
-                api_keys = config.app.get(cfg_key, [])
-                if isinstance(api_keys, str):
-                    api_keys = [api_keys]
-                api_key = ", ".join(api_keys)
-                return api_key
-
-            def save_keys_to_config(cfg_key, value):
-                value = value.replace(" ", "")
-                if value:
-                    config.app[cfg_key] = value.split(",")
-
             st.write(tr("Video Source Settings"))
 
             pexels_api_key = get_keys_from_config("pexels_api_keys")
+            pexels_original = config.app.get("pexels_api_keys", [])
             pexels_api_key = st.text_input(
-                tr("Pexels API Key"), value=pexels_api_key, type="password"
+                tr("Pexels API Key"), value=pexels_api_key, type="password",
+                key="pexels_api_key_sidebar",
             )
-            save_keys_to_config("pexels_api_keys", pexels_api_key)
+            save_keys_to_config("pexels_api_keys", pexels_api_key, pexels_original)
 
             pixabay_api_key = get_keys_from_config("pixabay_api_keys")
+            pixabay_original = config.app.get("pixabay_api_keys", [])
             pixabay_api_key = st.text_input(
-                tr("Pixabay API Key"), value=pixabay_api_key, type="password"
+                tr("Pixabay API Key"), value=pixabay_api_key, type="password",
+                key="pixabay_api_key_sidebar",
             )
-            save_keys_to_config("pixabay_api_keys", pixabay_api_key)
+            save_keys_to_config("pixabay_api_keys", pixabay_api_key, pixabay_original)
 
 llm_provider = config.app.get("llm_provider", "").lower()
 panel = st.columns(3)
@@ -675,6 +850,24 @@ with middle_panel:
         )
         params.video_source = video_sources[selected_index][1]
         config.app["video_source"] = params.video_source
+
+        # Show API Key input right next to the Video Source selector for visibility
+        if params.video_source == "pexels":
+            _pexels_key_display = get_keys_from_config("pexels_api_keys")
+            _pexels_key_original = config.app.get("pexels_api_keys", [])
+            _pexels_key_input = st.text_input(
+                tr("Pexels API Key"), value=_pexels_key_display, type="password",
+                key="pexels_api_key_videosource",
+            )
+            save_keys_to_config("pexels_api_keys", _pexels_key_input, _pexels_key_original)
+        elif params.video_source == "pixabay":
+            _pixabay_key_display = get_keys_from_config("pixabay_api_keys")
+            _pixabay_key_original = config.app.get("pixabay_api_keys", [])
+            _pixabay_key_input = st.text_input(
+                tr("Pixabay API Key"), value=_pixabay_key_display, type="password",
+                key="pixabay_api_key_videosource",
+            )
+            save_keys_to_config("pixabay_api_keys", _pixabay_key_input, _pixabay_key_original)
 
         if params.video_source == "local":
             # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
@@ -1157,10 +1350,43 @@ with right_panel:
                     config.save_config()
                     st.success(tr("Pixabay API Key deleted successfully"))
 
-start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary")
+_balance = _get_xiake_balance()
+_balance_insufficient = _balance < 0.30
+start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary", disabled=_balance_insufficient)
 if start_button:
     config.save_config()
     task_id = str(uuid4())
+
+    # ── 虾壳平台：生成前余额检查 + 扣费 ────────────────────────────────
+    _xiake_token = st.session_state.get("xiake_token", "")
+    if _xiake_token:
+        # 前端余额校验
+        _current_balance = _get_xiake_balance()
+        if _current_balance < 0.30:
+            st.error("⚠️ 余额不足，请充值后使用")
+            _refresh_xiake_balance()
+            scroll_to_bottom()
+            st.stop()
+
+        # 调后端扣费接口
+        try:
+            deduct_resp = requests.post(
+                f"{XIAKE_API_BASE}/xiake/deduct",
+                json={"amount": 0.30, "remark": "AI视频生成"},
+                headers={"Authorization": f"Bearer {_xiake_token}"},
+                timeout=10,
+            )
+            deduct_data = deduct_resp.json() if deduct_resp.status_code == 200 else {}
+            if deduct_resp.status_code != 200 or deduct_data.get("code") != 0:
+                _err_msg = deduct_data.get("message", f"HTTP {deduct_resp.status_code}")
+                st.error(f"扣费失败：{_err_msg}")
+                _refresh_xiake_balance()
+                scroll_to_bottom()
+                st.stop()
+        except Exception as e:
+            st.error(f"扣费请求失败：{e}")
+            scroll_to_bottom()
+            st.stop()
     if not params.video_subject and not params.video_script:
         st.error(tr("Video Script and Subject Cannot Both Be Empty"))
         scroll_to_bottom()
@@ -1172,12 +1398,12 @@ if start_button:
         st.stop()
 
     if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
-        st.error(tr("Please Enter the Pexels API Key"))
+        st.error(tr("Pexels API Key is required. Please enter it in the field above the Video Source selector, or in Basic Settings → Video Source Settings."))
         scroll_to_bottom()
         st.stop()
 
     if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
-        st.error(tr("Please Enter the Pixabay API Key"))
+        st.error(tr("Pixabay API Key is required. Please enter it in the field above the Video Source selector, or in Basic Settings → Video Source Settings."))
         scroll_to_bottom()
         st.stop()
 
@@ -1251,6 +1477,8 @@ if start_button:
 
     video_files = result.get("videos", [])
     st.success(tr("Video Generation Completed"))
+    # 生成完成后刷新余额
+    _refresh_xiake_balance()
     try:
         if video_files:
             player_cols = st.columns(len(video_files) * 2 + 1)
